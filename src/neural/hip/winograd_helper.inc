@@ -14,15 +14,6 @@
 
   You should have received a copy of the GNU General Public License
   along with Leela Chess.  If not, see <http://www.gnu.org/licenses/>.
-
-  Additional permission under GNU GPL version 3 section 7
-
-  If you modify this Program, or any covered work, by linking or
-  combining it with NVIDIA Corporation's libraries from the NVIDIA CUDA
-  Toolkit and the NVIDIA CUDA Deep Neural Network library (or a
-  modified version of those libraries), containing parts covered by the
-  terms of the respective license agreement, the licensors of this
-  Program grant you additional permission to convey the resulting work.
 */
 
 
@@ -616,7 +607,7 @@ void FilterTransform(int N, int C, T* transformedFilter, const T* filter) {
   filterTransform_kernel<<<kBlocks, kBlockSize>>>(N, C, N * C,
                                                   transformedFilter, filter);
 
-  ReportCUDAErrors(hipGetLastError());
+  ReportHIPErrors(hipGetLastError());
 }
 
 template <typename T, bool nhcw>
@@ -627,7 +618,7 @@ void InputTransform(int N, int C, T* transformed_input, const T* input,
   InputTransform_kernel<T, nhcw><<<N, C, 0, stream>>>(N, C, input,
                                                       transformed_input);
 
-  ReportCUDAErrors(hipGetLastError());
+  ReportHIPErrors(hipGetLastError());
 }
 
 template <typename T, bool use_se, bool relu, bool use_bias, bool use_skip,
@@ -639,7 +630,7 @@ void OutputTransform(int N, int C, int se_K, T* output, const T* input,
   OutputTransform_kernel<T, use_se, relu, use_bias, use_skip, skipInput_nhcw,
                          output_nhcw><<<N, C, 0, stream>>>(
       N, C, se_K, output, input, skip, bias, w1, b1, w2, b2);
-  ReportCUDAErrors(hipGetLastError());
+  ReportHIPErrors(hipGetLastError());
 }
 
 }  // namespace hip_backend

@@ -14,20 +14,11 @@
 
   You should have received a copy of the GNU General Public License
   along with Leela Chess.  If not, see <http://www.gnu.org/licenses/>.
-
-  Additional permission under GNU GPL version 3 section 7
-
-  If you modify this Program, or any covered work, by linking or
-  combining it with NVIDIA Corporation's libraries from the NVIDIA CUDA
-  Toolkit and the NVIDIA CUDA Deep Neural Network library (or a
-  modified version of those libraries), containing parts covered by the
-  terms of the respective license agreement, the licensors of this
-  Program grant you additional permission to convey the resulting work.
 */
 
 
 #include <hip/hip_runtime.h>
-#include "cuda_common.h"
+#include "hip_common.h"
 #include "winograd_helper.inc"
 
 namespace lczero {
@@ -179,7 +170,7 @@ bool Se_Fp16_NHWC(int N, int C, int numFc1Out, half* output, const half* skip,
     // TODO: support other sizes.
     return false;
   }
-  ReportCUDAErrors(hipGetLastError());
+  ReportHIPErrors(hipGetLastError());
   return true;
 }
 
@@ -448,7 +439,7 @@ void OutputInputTransform(int N, int C, int se_K, T* output, const T* input,
                                                   use_skip>), dim3(N), dim3(C), 0, stream, N, C, se_K, output, input, (half*)skip, bias, w1,
                               b1, w2, b2);
   }
-  ReportCUDAErrors(hipGetLastError());
+  ReportHIPErrors(hipGetLastError());
 }
 
 template void FilterTransform<half>(int N, int C, half* transformedFilter,

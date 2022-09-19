@@ -14,15 +14,6 @@
 
   You should have received a copy of the GNU General Public License
   along with Leela Chess.  If not, see <http://www.gnu.org/licenses/>.
-
-  Additional permission under GNU GPL version 3 section 7
-
-  If you modify this Program, or any covered work, by linking or
-  combining it with NVIDIA Corporation's libraries from the NVIDIA CUDA
-  Toolkit and the NVIDIA CUDA Deep Neural Network library (or a
-  modified version of those libraries), containing parts covered by the
-  terms of the respective license agreement, the licensors of this
-  Program grant you additional permission to convey the resulting work.
 */
 
 #define __HIP_PLATFORM_AMD__
@@ -31,7 +22,7 @@
 #include <cassert>
 #include <cstring>
 #include <vector>
-#include "cuda_common.h"
+#include "hip_common.h"
 #include "kernels.h"
 
 namespace lczero {
@@ -52,33 +43,250 @@ template <typename DataType>
 BaseLayer<DataType>::BaseLayer(int c, int h, int w, BaseLayer* ip)
     : input_(ip), C(c), H(h), W(w), nhwc_(ip->nhwc_) {}
 
+#ifdef USE_CUDNN
+template <typename DataType>
+void ConvLayer<DataType>::init() {
+  // Allocate memory for weights (filter tensor) and biases.
+  const size_t weight_size =
+      sizeof(DataType) * c_input_ * C * filter_size_ * filter_size_;
+  ReportHIPErrors(hipMalloc(&weights, weight_size));
+
+  const size_t bias_size = sizeof(DataType) * C;
+  ReportHIPErrors(hipMalloc(&biases, bias_size));
+
+  const bool fp16 = std::is_same<half, DataType>::value;
+  const hipdnnDataType_t dataType =
+      std::is_same<half, DataType>::value ? HIPDNN_DATA_HALF : HIPDNN_DATA_FLOAT;
+
+  const hipdnnTensorFormat_t layout =
+      nhwc_ ? HIPDNN_TENSOR_NHWC : HIPDNN_TENSOR_NCHW;
+
+  // Create cudnn objects for various tensors, algorithms, etc.
+  hipdnnCreateFilterDescriptor(&filter_desc_);
+  hipdnnCreateConvolutionDescriptor(&conv_desc_);
+  hipdnnCreateTensorDescriptor(&out_tensor_desc_);
+  hipdnnCreateTensorDescriptor(&in_tensor_desc_);
+  hipdnnCreateTensorDescriptor(&bias_desc_);
+  hipdnnCreateActivationDescriptor(&activation_);
+
+  hipdnnSetFilter4dDescriptor(filter_desc_, dataType, layout, GetC(), c_input_,
+                             filter_size_, filter_size_);
+
+  ReportCUDNNErrors(
+      hipdnnSetTensor4dDescriptor(bias_desc_, layout, dataType, 1, C, 1, 1));
+
+  const int padding = filter_size_ / 2;
+  const bool crossCorr = 1;
+
+  ReportCUDNNErrors(hipdnnSetConvolution2dDescriptor(
+      conv_desc_, padding, padding, 1, 1, 1, 1,
+      crossCorr ? HIPDNN_CROSS_CORRELATION : HIPDNN_CONVOLUTION, dataType));
+
+  if (fp16 && nhwc_)
+    ReportCUDNNErrors(
+        hipdnnSetConvolutionMathType(conv_desc_, HIPDNN_TENSOR_OP_MATH));
+
+  // TODO: dynamic selection of algorithm!
+  if ((C > 32) && (!nhwc_) && (filter_size_ > 1)) {
+    conv_algo_ = HIPDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED;
+  } else {
+    conv_algo_ = HIPDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
+  }
+
+  if (use_relu_) {
+    hipdnnSetActivationDescriptor(activation_, HIPDNN_ACTIVATION_RELU,
+                                 HIPDNN_NOT_PROPAGATE_NAN, 0.0);
+  }
+#if CUDNN_MAJOR != 7 || CUDNN_MINOR != 0
+  else {
+    hipdnnSetActivationDescriptor(activation_, HIPDNN_ACTIVATION_PATHTRU,
+                                 HIPDNN_NOT_PROPAGATE_NAN, 0.0);
+  }
+#endif
+}
+
+template <typename DataType>
+ConvLayer<DataType>::ConvLayer(BaseLayer<DataType>* ip, int C, int H, int W,
+                               int filter, int Cin, bool relu, bool bias)
+    : BaseLayer<DataType>(C, H, W, ip),
+      c_input_(Cin),
+      filter_size_(filter),
+      use_relu_(relu),
+      use_bias_(bias) {
+  init();
+}
+
+template <typename DataType>
+ConvLayer<DataType>::ConvLayer(bool nhwc, int C, int H, int W, int filter,
+                               int Cin, bool relu, bool bias)
+    : BaseLayer<DataType>(C, H, W, nullptr, nhwc),
+      c_input_(Cin),
+      filter_size_(filter),
+      use_relu_(relu),
+      use_bias_(bias) {
+  init();
+}
+
+template <>
+void ConvLayer<half>::LoadWeights(float* pfilter, float* pBias, void* scratch) {
+  const size_t weight_size =
+      sizeof(float) * c_input_ * C * filter_size_ * filter_size_;
+  const size_t bias_size = sizeof(float) * C;
+  // Also need to convert from fp32 NCHW to fp16 NHWC
+  // first copy from CPU memory to scratch space in GPU memory
+  // and then do the type / layout conversion using a kernel.
+  assert(scratch);
+  ReportHIPErrors(
+      hipMemcpy(scratch, pfilter, weight_size, hipMemcpyHostToDevice));
+
+  if (nhwc_) {
+    fp32NCHWtofp16NHWC((half*)weights, (float*)scratch, C, c_input_, C,
+                       c_input_, filter_size_, filter_size_);
+  } else {
+    copyTypeConverted((half*)weights, (float*)scratch,
+                      C * c_input_ * filter_size_ * filter_size_, 0);
+  }
+
+  if (pBias) {
+    ReportHIPErrors(
+        hipMemcpy(scratch, pBias, bias_size, hipMemcpyHostToDevice));
+
+    copyTypeConverted((half*)biases, (float*)scratch, C, 0);
+  }
+}
+
+template <>
+void ConvLayer<float>::LoadWeights(float* pfilter, float* pBias,
+                                   void* /*scratch*/) {
+  const size_t weight_size =
+      sizeof(float) * c_input_ * C * filter_size_ * filter_size_;
+  const size_t bias_size = sizeof(float) * C;
+  ReportHIPErrors(
+      hipMemcpy(weights, pfilter, weight_size, hipMemcpyHostToDevice));
+
+  if (pBias) {
+    ReportHIPErrors(
+        hipMemcpy(biases, pBias, bias_size, hipMemcpyHostToDevice));
+  } else {
+    ReportHIPErrors(hipMemset(biases, 0, bias_size));
+  }
+}
+
+template <typename DataType>
+void ConvLayer<DataType>::Eval(int N, DataType* output, const DataType* input,
+                               const DataType* input2, void* scratch,
+                               size_t scratch_size, hipdnnHandle_t cudnn,
+                               hipblasHandle_t /*cublas*/, hipStream_t stream) {
+  const hipdnnDataType_t dataType =
+      std::is_same<half, DataType>::value ? HIPDNN_DATA_HALF : HIPDNN_DATA_FLOAT;
+
+  const hipdnnTensorFormat_t layout =
+      nhwc_ ? HIPDNN_TENSOR_NHWC : HIPDNN_TENSOR_NCHW;
+
+  ReportCUDNNErrors(hipdnnSetTensor4dDescriptor(out_tensor_desc_, layout,
+                                               dataType, N, C, H, W));
+
+  ReportCUDNNErrors(hipdnnSetTensor4dDescriptor(in_tensor_desc_, layout,
+                                               dataType, N, c_input_, H, W));
+
+  float alpha = 1.0f, beta = 0.0f;
+
+  if (!(use_relu_ || use_bias_ || input2)) {
+    ReportCUDNNErrors(hipdnnConvolutionForward(
+        cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
+        conv_desc_, conv_algo_, scratch, scratch_size, &beta, out_tensor_desc_,
+        output));
+  }
+#if CUDNN_MAJOR != 7 || CUDNN_MINOR != 0
+  else if (input2) {
+    // fused bias + sum + relu!
+    ReportCUDNNErrors(cudnnConvolutionBiasActivationForward(
+        cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
+        conv_desc_, conv_algo_, scratch, scratch_size, &alpha, out_tensor_desc_,
+        input2, bias_desc_, biases, activation_, out_tensor_desc_, output));
+  } else {
+    // For some reason cudnn doesn't support just Convolution + Bias with nchw
+    // (winograd algorithm) it works fine when RELU is also needed which is
+    // somewhat strange.
+    if ((!nhwc_) && (!use_relu_)) {
+      ReportCUDNNErrors(hipdnnConvolutionForward(
+          cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
+          conv_desc_, conv_algo_, scratch, scratch_size, &beta,
+          out_tensor_desc_, output));
+      // add bias
+      addBias_NCHW(output, output, biases, N, C, H, W, false, stream);
+    } else {
+      ReportCUDNNErrors(cudnnConvolutionBiasActivationForward(
+          cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
+          conv_desc_, conv_algo_, scratch, scratch_size, &beta,
+          out_tensor_desc_, output, bias_desc_, biases, activation_,
+          out_tensor_desc_, output));
+    }
+  }
+#else
+  else {
+    ReportCUDNNErrors(hipdnnConvolutionForward(
+        cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
+        conv_desc_, conv_algo_, scratch, scratch_size,
+        (input2 == output) ? &alpha : &beta, out_tensor_desc_, output));
+    if (input2 && input2 != output) {
+      ReportCUDNNErrors(hipdnnAddTensor(cudnn, &alpha, out_tensor_desc_, input2,
+                                       &alpha, out_tensor_desc_, output));
+    }
+    if (use_bias_) {
+      ReportCUDNNErrors(hipdnnAddTensor(cudnn, &alpha, bias_desc_, biases,
+                                       &alpha, out_tensor_desc_, output));
+    }
+    if (use_relu_) {
+      ReportCUDNNErrors(hipdnnActivationForward(cudnn, activation_, &alpha,
+                                               out_tensor_desc_, output, &beta,
+                                               out_tensor_desc_, output));
+    }
+  }
+#endif
+}
+
+template <typename DataType>
+ConvLayer<DataType>::~ConvLayer() {
+  ReportHIPErrors(hipFree(weights));
+  ReportHIPErrors(hipFree(biases));
+
+  hipdnnDestroyFilterDescriptor(filter_desc_);
+  hipdnnDestroyConvolutionDescriptor(conv_desc_);
+  hipdnnDestroyTensorDescriptor(bias_desc_);
+  hipdnnDestroyTensorDescriptor(in_tensor_desc_);
+  hipdnnDestroyTensorDescriptor(out_tensor_desc_);
+  hipdnnDestroyActivationDescriptor(activation_);
+}
+#endif
+
 template <typename DataType>
 SELayer<DataType>::SELayer(BaseLayer<DataType>* ip, int fc1Outputs,
                            bool addPrevLayerBias)
     : BaseLayer<DataType>(ip->GetC(), ip->GetH(), ip->GetW(), ip),
       numFc1Out_(fc1Outputs),
       addPrevLayerBias_(addPrevLayerBias) {
-  ReportCUDAErrors(hipMalloc(&w1_, C * numFc1Out_ * sizeof(DataType)));
-  ReportCUDAErrors(hipMalloc(&w2_, 2 * C * numFc1Out_ * sizeof(DataType)));
+  ReportHIPErrors(hipMalloc(&w1_, C * numFc1Out_ * sizeof(DataType)));
+  ReportHIPErrors(hipMalloc(&w2_, 2 * C * numFc1Out_ * sizeof(DataType)));
 
   if (kUseFusedSELayer && nhwc_) {
-    ReportCUDAErrors(hipMalloc(&w1_t_, C * numFc1Out_ * sizeof(DataType)));
-    ReportCUDAErrors(hipMalloc(&w2_t_, 2 * C * numFc1Out_ * sizeof(DataType)));
+    ReportHIPErrors(hipMalloc(&w1_t_, C * numFc1Out_ * sizeof(DataType)));
+    ReportHIPErrors(hipMalloc(&w2_t_, 2 * C * numFc1Out_ * sizeof(DataType)));
   }
 
-  ReportCUDAErrors(hipMalloc(&b1_, numFc1Out_ * sizeof(DataType)));
-  ReportCUDAErrors(hipMalloc(&b2_, 2 * C * sizeof(DataType)));
+  ReportHIPErrors(hipMalloc(&b1_, numFc1Out_ * sizeof(DataType)));
+  ReportHIPErrors(hipMalloc(&b2_, 2 * C * sizeof(DataType)));
 
-  ReportCUDAErrors(hipMalloc(&bPrev_, C * sizeof(DataType)));
+  ReportHIPErrors(hipMalloc(&bPrev_, C * sizeof(DataType)));
 }
 
 template <typename DataType>
 SELayer<DataType>::~SELayer() {
-  ReportCUDAErrors(hipFree(w1_));
-  ReportCUDAErrors(hipFree(w2_));
-  ReportCUDAErrors(hipFree(b1_));
-  ReportCUDAErrors(hipFree(b2_));
-  ReportCUDAErrors(hipFree(bPrev_));
+  ReportHIPErrors(hipFree(w1_));
+  ReportHIPErrors(hipFree(w2_));
+  ReportHIPErrors(hipFree(b1_));
+  ReportHIPErrors(hipFree(b2_));
+  ReportHIPErrors(hipFree(bPrev_));
 }
 
 template <>
@@ -90,22 +298,22 @@ void SELayer<float>::LoadWeights(float* w1, float* b1, float* w2, float* b2,
   const size_t weight_size2 = 2 * weight_size1;
 
   // Weight for the first FC layer.
-  ReportCUDAErrors(hipMemcpy(w1_, w1, weight_size1, hipMemcpyHostToDevice));
+  ReportHIPErrors(hipMemcpy(w1_, w1, weight_size1, hipMemcpyHostToDevice));
 
   // Weight for the second FC layer.
-  ReportCUDAErrors(hipMemcpy(w2_, w2, weight_size2, hipMemcpyHostToDevice));
+  ReportHIPErrors(hipMemcpy(w2_, w2, weight_size2, hipMemcpyHostToDevice));
 
   // Bias for the first FC layer.
-  ReportCUDAErrors(
+  ReportHIPErrors(
       hipMemcpy(b1_, b1, numFc1Out_ * sizeof(float), hipMemcpyHostToDevice));
 
   // Bias for the second FC layer.
-  ReportCUDAErrors(
+  ReportHIPErrors(
       hipMemcpy(b2_, b2, 2 * C * sizeof(float), hipMemcpyHostToDevice));
 
   // Bias for previous layer (Convolution).
   if (prevLayerBias) {
-    ReportCUDAErrors(hipMemcpy(bPrev_, prevLayerBias, C * sizeof(float),
+    ReportHIPErrors(hipMemcpy(bPrev_, prevLayerBias, C * sizeof(float),
                                 hipMemcpyHostToDevice));
   }
 }
@@ -128,41 +336,41 @@ void SELayer<half>::LoadWeights(float* w1, float* b1, float* w2, float* b2,
   std::vector<float> temp(weight_size2);
 
   // Weight for the first FC layer.
-  ReportCUDAErrors(
+  ReportHIPErrors(
       hipMemcpy(scratch, w1, weight_size1, hipMemcpyHostToDevice));
   copyTypeConverted((half*)w1_, (float*)scratch, (int)num_weights1, 0);
   if (kUseFusedSELayer && nhwc_) {
     // transposed copy for fused SE kernel
     cpuTranspose(temp.data(), w1, numFc1Out_, C);
-    ReportCUDAErrors(
+    ReportHIPErrors(
         hipMemcpy(scratch, temp.data(), weight_size1, hipMemcpyHostToDevice));
     copyTypeConverted((half*)w1_t_, (float*)scratch, (int)num_weights1, 0);
   }
 
   // Weight for the second FC layer.
-  ReportCUDAErrors(
+  ReportHIPErrors(
       hipMemcpy(scratch, w2, weight_size2, hipMemcpyHostToDevice));
   copyTypeConverted((half*)w2_, (float*)scratch, (int)num_weights2, 0);
   if (kUseFusedSELayer && nhwc_) {
     cpuTranspose(temp.data(), w2, 2 * C, numFc1Out_);
-    ReportCUDAErrors(
+    ReportHIPErrors(
         hipMemcpy(scratch, temp.data(), weight_size2, hipMemcpyHostToDevice));
     copyTypeConverted((half*)w2_t_, (float*)scratch, (int)num_weights2, 0);
   }
 
   // Bias for the first FC layer.
-  ReportCUDAErrors(hipMemcpy(scratch, b1, numFc1Out_ * sizeof(float),
+  ReportHIPErrors(hipMemcpy(scratch, b1, numFc1Out_ * sizeof(float),
                               hipMemcpyHostToDevice));
   copyTypeConverted((half*)b1_, (float*)scratch, numFc1Out_, 0);
 
   // Bias for the second FC layer.
-  ReportCUDAErrors(
+  ReportHIPErrors(
       hipMemcpy(scratch, b2, 2 * C * sizeof(float), hipMemcpyHostToDevice));
   copyTypeConverted((half*)b2_, (float*)scratch, 2 * C, 0);
 
   // Bias for previous layer (Convolution).
   if (prevLayerBias) {
-    ReportCUDAErrors(hipMemcpy(scratch, prevLayerBias, C * sizeof(float),
+    ReportHIPErrors(hipMemcpy(scratch, prevLayerBias, C * sizeof(float),
                                 hipMemcpyHostToDevice));
     copyTypeConverted((half*)bPrev_, (float*)scratch, C, 0);
   }
@@ -254,9 +462,9 @@ FCLayer<DataType>::FCLayer(BaseLayer<DataType>* ip, int C, int H, int W,
   const size_t weight_size =
       sizeof(DataType) * C * H * W * ip->GetC() * ip->GetH() * ip->GetW();
   const size_t bias_size = sizeof(DataType) * C * H * W;
-  ReportCUDAErrors(hipMalloc(&weights_, weight_size));
+  ReportHIPErrors(hipMalloc(&weights_, weight_size));
   if (use_bias_) {
-    ReportCUDAErrors(hipMalloc(&biases_, bias_size));
+    ReportHIPErrors(hipMalloc(&biases_, bias_size));
   } else {
     biases_ = nullptr;
   }
@@ -273,7 +481,7 @@ void FCLayer<half>::LoadWeights(float* cpuWeight, float* cpuBias,
 
   // also need to convert from fp32 to fp16
   assert(scratch);
-  ReportCUDAErrors(
+  ReportHIPErrors(
       hipMemcpy(scratch, cpuWeight, weight_size, hipMemcpyHostToDevice));
 
   if (nhwc_) {
@@ -285,7 +493,7 @@ void FCLayer<half>::LoadWeights(float* cpuWeight, float* cpuBias,
   }
 
   if (cpuBias) {
-    ReportCUDAErrors(
+    ReportHIPErrors(
         hipMemcpy(scratch, cpuBias, bias_size, hipMemcpyHostToDevice));
     copyTypeConverted((half*)biases_, (float*)scratch, (int)num_biases, 0);
   }
@@ -300,10 +508,10 @@ void FCLayer<float>::LoadWeights(float* cpuWeight, float* cpuBias,
   const size_t num_biases = C * H * W;
   const size_t bias_size = sizeof(float) * num_biases;
 
-  ReportCUDAErrors(
+  ReportHIPErrors(
       hipMemcpy(weights_, cpuWeight, weight_size, hipMemcpyHostToDevice));
   if (use_bias_) {
-    ReportCUDAErrors(
+    ReportHIPErrors(
         hipMemcpy(biases_, cpuBias, bias_size, hipMemcpyHostToDevice));
   }
 }
@@ -357,8 +565,8 @@ void FCLayer<float>::Eval(int N, float* output_tensor,
 
 template <typename DataType>
 FCLayer<DataType>::~FCLayer() {
-  ReportCUDAErrors(hipFree(weights_));
-  ReportCUDAErrors(hipFree(biases_));
+  ReportHIPErrors(hipFree(weights_));
+  ReportHIPErrors(hipFree(biases_));
 }
 
 template <typename DataType>
@@ -366,7 +574,7 @@ PolicyMapLayer<DataType>::PolicyMapLayer(BaseLayer<DataType>* ip, int C, int H,
                                          int W, int usedSize)
     : BaseLayer<DataType>(C, H, W, ip), used_size_(usedSize) {
   size_t weight_size = sizeof(short) * this->input_->GetC() * 64;
-  ReportCUDAErrors(hipMalloc(&weights_, weight_size));
+  ReportHIPErrors(hipMalloc(&weights_, weight_size));
 }
 
 template <typename DataType>
@@ -435,11 +643,11 @@ void PolicyMapLayer<DataType>::LoadWeights(const short* cpuWeight,
         else
           convertedWeights[hw * Cin + c] = -1;
       }
-    ReportCUDAErrors(hipMemcpy(weights_, convertedWeights.data(),
+    ReportHIPErrors(hipMemcpy(weights_, convertedWeights.data(),
                                 used_size_ * sizeof(short),
                                 hipMemcpyHostToDevice));
   } else {
-    ReportCUDAErrors(
+    ReportHIPErrors(
         hipMemcpy(weights_, cpuWeight, weight_size, hipMemcpyHostToDevice));
   }
 }
@@ -459,7 +667,7 @@ void PolicyMapLayer<DataType>::Eval(int N, DataType* output_tensor,
 
 template <typename DataType>
 PolicyMapLayer<DataType>::~PolicyMapLayer() {
-  ReportCUDAErrors(hipFree(weights_));
+  ReportHIPErrors(hipFree(weights_));
 }
 
 template <typename DataType>
@@ -480,11 +688,11 @@ FusedWinogradConvSELayer<DataType>::FusedWinogradConvSELayer(
 
   if (use_bias_) {
     const size_t bias_size = sizeof(DataType) * C;
-    ReportCUDAErrors(hipMalloc(&biases_, bias_size));
+    ReportHIPErrors(hipMalloc(&biases_, bias_size));
   }
 
   // 6x6 transformed filter size, for 3x3 convolution
-  ReportCUDAErrors(hipMalloc(&transformed_weights_, weight_size * 4));
+  ReportHIPErrors(hipMalloc(&transformed_weights_, weight_size * 4));
 
   if (has_se_) {
     const size_t num_weights1 = C * se_k_;
@@ -497,10 +705,10 @@ FusedWinogradConvSELayer<DataType>::FusedWinogradConvSELayer(
     const size_t biases_size1 = sizeof(DataType) * num_biases1;
     const size_t biases_size2 = sizeof(DataType) * num_biases2;
 
-    ReportCUDAErrors(hipMalloc(&w1_, weight_size1));
-    ReportCUDAErrors(hipMalloc(&w2_, weight_size2));
-    ReportCUDAErrors(hipMalloc(&b1_, biases_size1));
-    ReportCUDAErrors(hipMalloc(&b2_, biases_size2));
+    ReportHIPErrors(hipMalloc(&w1_, weight_size1));
+    ReportHIPErrors(hipMalloc(&w2_, weight_size2));
+    ReportHIPErrors(hipMalloc(&b1_, biases_size1));
+    ReportHIPErrors(hipMalloc(&b2_, biases_size2));
   }
 }
 
@@ -517,12 +725,12 @@ void FusedWinogradConvSELayer<DataType>::LoadWeights(float* pfilter,
   // first copy from CPU memory to scratch space in GPU memory
   // and then do the type conversion using a kernel
   assert(scratch);
-  ReportCUDAErrors(
+  ReportHIPErrors(
       hipMemcpy(scratch, pfilter, weight_size, hipMemcpyHostToDevice));
   copyTypeConverted((DataType*)weights, (float*)scratch, C * c_input_ * 3 * 3, 0);
 
   if (pBias) {
-    ReportCUDAErrors(
+    ReportHIPErrors(
         hipMemcpy(scratch, pBias, bias_size, hipMemcpyHostToDevice));
     copyTypeConverted((DataType*)biases_, (float*)scratch, C, 0);
   }
@@ -550,23 +758,23 @@ void FusedWinogradConvSELayer<DataType>::LoadSEWeights(float* w1, float* b1,
   std::vector<float> temp_transposed(num_weights2);
 
   CpuTranspose(temp_transposed.data(), w1, se_k_, C);
-  ReportCUDAErrors(hipMemcpy(scratch, temp_transposed.data(), num_weights1*sizeof(float),
+  ReportHIPErrors(hipMemcpy(scratch, temp_transposed.data(), num_weights1*sizeof(float),
                               hipMemcpyHostToDevice));
   copyTypeConverted((DataType*)w1_, (float*)scratch, (int)num_weights1, 0);
 
   CpuTranspose(temp_transposed.data(), w2, 2 * C, se_k_);
-  ReportCUDAErrors(hipMemcpy(scratch, temp_transposed.data(),
+  ReportHIPErrors(hipMemcpy(scratch, temp_transposed.data(),
                               num_weights2 * sizeof(float),
                               hipMemcpyHostToDevice));
   copyTypeConverted((DataType*)w2_, (float*)scratch, (int)num_weights2, 0);
 
 
 
-  ReportCUDAErrors(hipMemcpy(scratch, b1, num_biases1 * sizeof(float),
+  ReportHIPErrors(hipMemcpy(scratch, b1, num_biases1 * sizeof(float),
                               hipMemcpyHostToDevice));
   copyTypeConverted((DataType*)b1_, (float*)scratch, (int)num_biases1, 0);
 
-  ReportCUDAErrors(hipMemcpy(scratch, b2, num_biases2 * sizeof(float),
+  ReportHIPErrors(hipMemcpy(scratch, b2, num_biases2 * sizeof(float),
                               hipMemcpyHostToDevice));
   copyTypeConverted((DataType*)b2_, (float*)scratch, (int)num_biases2, 0);
 }
@@ -656,13 +864,13 @@ void FusedWinogradConvSELayer<DataType>::Eval(
 
 template <typename DataType>
 FusedWinogradConvSELayer<DataType>::~FusedWinogradConvSELayer() {
-  ReportCUDAErrors(hipFree(transformed_weights_));
-  if (use_bias_) ReportCUDAErrors(hipFree(biases_));
+  ReportHIPErrors(hipFree(transformed_weights_));
+  if (use_bias_) ReportHIPErrors(hipFree(biases_));
   if (has_se_) {
-    ReportCUDAErrors(hipFree(w1_));
-    ReportCUDAErrors(hipFree(w2_));
-    ReportCUDAErrors(hipFree(b1_));
-    ReportCUDAErrors(hipFree(b2_));
+    ReportHIPErrors(hipFree(w1_));
+    ReportHIPErrors(hipFree(w2_));
+    ReportHIPErrors(hipFree(b1_));
+    ReportHIPErrors(hipFree(b2_));
   }
 }
 
@@ -677,11 +885,11 @@ Conv1Layer<DataType>::Conv1Layer(BaseLayer<DataType>* ip, int C, int H, int W,
       use_gemm_ex_(use_gemm_ex) {
   // Allocate memory for weights (filter tensor) and biases.
   const size_t weight_size = sizeof(DataType) * c_input_ * C * 1 * 1;
-  ReportCUDAErrors(hipMalloc(&weights_, weight_size));
+  ReportHIPErrors(hipMalloc(&weights_, weight_size));
 
   if (use_bias_) {
     const size_t bias_size = sizeof(DataType) * C;
-    ReportCUDAErrors(hipMalloc(&biases_, bias_size));
+    ReportHIPErrors(hipMalloc(&biases_, bias_size));
   }
 }
 
@@ -694,12 +902,12 @@ void Conv1Layer<DataType>::LoadWeights(float* pfilter, float* pBias,
   // first copy from CPU memory to scratch space in GPU memory
   // and then do the type conversion using a kernel
   assert(scratch);
-  ReportCUDAErrors(
+  ReportHIPErrors(
       hipMemcpy(scratch, pfilter, weight_size, hipMemcpyHostToDevice));
   copyTypeConverted((DataType*)weights_, (float*)scratch, C * c_input_ * 1 * 1, 0);
 
   if (pBias) {
-    ReportCUDAErrors(
+    ReportHIPErrors(
         hipMemcpy(scratch, pBias, bias_size, hipMemcpyHostToDevice));
     copyTypeConverted((DataType*)biases_, (float*)scratch, C, 0);
   }
@@ -766,8 +974,8 @@ void Conv1Layer<DataType>::Eval(int N, DataType* output, const DataType* input,
 
 template <typename DataType>
 Conv1Layer<DataType>::~Conv1Layer() {
-  ReportCUDAErrors(hipFree(weights_));
-  if (use_bias_) ReportCUDAErrors(hipFree(biases_));
+  ReportHIPErrors(hipFree(weights_));
+  if (use_bias_) ReportHIPErrors(hipFree(biases_));
 }
 
 template <typename DataType>
@@ -784,12 +992,12 @@ ResidualBlock<DataType>::ResidualBlock(
   const size_t weight_size = sizeof(DataType) * C * C * 3 * 3;
 
   const size_t bias_size = sizeof(DataType) * C;
-  ReportCUDAErrors(hipMalloc(&biases0_, bias_size));
-  ReportCUDAErrors(hipMalloc(&biases1_, bias_size));
+  ReportHIPErrors(hipMalloc(&biases0_, bias_size));
+  ReportHIPErrors(hipMalloc(&biases1_, bias_size));
 
   // 6x6 transformed filter size, for 3x3 convolution
-  ReportCUDAErrors(hipMalloc(&transformed_weights0_, weight_size * 4));
-  ReportCUDAErrors(hipMalloc(&transformed_weights1_, weight_size * 4));
+  ReportHIPErrors(hipMalloc(&transformed_weights0_, weight_size * 4));
+  ReportHIPErrors(hipMalloc(&transformed_weights1_, weight_size * 4));
 
   if (has_se_) {
     const size_t num_weights1 = C * se_k_;
@@ -802,10 +1010,10 @@ ResidualBlock<DataType>::ResidualBlock(
     const size_t biases_size1 = sizeof(DataType) * num_biases1;
     const size_t biases_size2 = sizeof(DataType) * num_biases2;
 
-    ReportCUDAErrors(hipMalloc(&w1_, weight_size1));
-    ReportCUDAErrors(hipMalloc(&w2_, weight_size2));
-    ReportCUDAErrors(hipMalloc(&b1_, biases_size1));
-    ReportCUDAErrors(hipMalloc(&b2_, biases_size2));
+    ReportHIPErrors(hipMalloc(&w1_, weight_size1));
+    ReportHIPErrors(hipMalloc(&w2_, weight_size2));
+    ReportHIPErrors(hipMalloc(&b1_, biases_size1));
+    ReportHIPErrors(hipMalloc(&b2_, biases_size2));
   }
 }
 
@@ -823,12 +1031,12 @@ void ResidualBlock<DataType>::LoadWeights0(float* pfilter,
   // first copy from CPU memory to scratch space in GPU memory
   // and then do the type conversion using a kernel
   assert(scratch);
-  ReportCUDAErrors(
+  ReportHIPErrors(
       hipMemcpy(scratch, pfilter, weight_size, hipMemcpyHostToDevice));
   copyTypeConverted((DataType*)weights, (float*)scratch, C * c_input_ * 3 * 3, 0);
 
   if (pBias) {
-    ReportCUDAErrors(
+    ReportHIPErrors(
         hipMemcpy(scratch, pBias, bias_size, hipMemcpyHostToDevice));
     copyTypeConverted((DataType*)biases0_, (float*)scratch, C, 0);
   }
@@ -849,12 +1057,12 @@ void ResidualBlock<DataType>::LoadWeights1(float* pfilter, float* pBias,
   // first copy from CPU memory to scratch space in GPU memory
   // and then do the type conversion using a kernel
   assert(scratch);
-  ReportCUDAErrors(
+  ReportHIPErrors(
       hipMemcpy(scratch, pfilter, weight_size, hipMemcpyHostToDevice));
   copyTypeConverted((DataType*)weights, (float*)scratch, C * C * 3 * 3, 0);
 
   if (pBias) {
-    ReportCUDAErrors(
+    ReportHIPErrors(
         hipMemcpy(scratch, pBias, bias_size, hipMemcpyHostToDevice));
     copyTypeConverted((DataType*)biases1_, (float*)scratch, C, 0);
   }
@@ -876,22 +1084,22 @@ void ResidualBlock<DataType>::LoadSEWeights(float* w1, float* b1,
   std::vector<float> temp_transposed(num_weights2);
 
   CpuTranspose(temp_transposed.data(), w1, se_k_, C);
-  ReportCUDAErrors(hipMemcpy(scratch, temp_transposed.data(),
+  ReportHIPErrors(hipMemcpy(scratch, temp_transposed.data(),
                               num_weights1 * sizeof(float),
                               hipMemcpyHostToDevice));
   copyTypeConverted((DataType*)w1_, (float*)scratch, (int)num_weights1, 0);
 
   CpuTranspose(temp_transposed.data(), w2, 2 * C, se_k_);
-  ReportCUDAErrors(hipMemcpy(scratch, temp_transposed.data(),
+  ReportHIPErrors(hipMemcpy(scratch, temp_transposed.data(),
                               num_weights2 * sizeof(float),
                               hipMemcpyHostToDevice));
   copyTypeConverted((DataType*)w2_, (float*)scratch, (int)num_weights2, 0);
 
-  ReportCUDAErrors(hipMemcpy(scratch, b1, num_biases1 * sizeof(float),
+  ReportHIPErrors(hipMemcpy(scratch, b1, num_biases1 * sizeof(float),
                               hipMemcpyHostToDevice));
   copyTypeConverted((DataType*)b1_, (float*)scratch, (int)num_biases1, 0);
 
-  ReportCUDAErrors(hipMemcpy(scratch, b2, num_biases2 * sizeof(float),
+  ReportHIPErrors(hipMemcpy(scratch, b2, num_biases2 * sizeof(float),
                               hipMemcpyHostToDevice));
   copyTypeConverted((DataType*)b2_, (float*)scratch, (int)num_biases2, 0);
 }
@@ -1000,20 +1208,25 @@ void ResidualBlock<DataType>::Eval(
 
 template <typename DataType>
 ResidualBlock<DataType>::~ResidualBlock() {
-  ReportCUDAErrors(hipFree(transformed_weights0_));
-  ReportCUDAErrors(hipFree(biases0_));
-  ReportCUDAErrors(hipFree(transformed_weights1_));
-  ReportCUDAErrors(hipFree(biases1_));
+  ReportHIPErrors(hipFree(transformed_weights0_));
+  ReportHIPErrors(hipFree(biases0_));
+  ReportHIPErrors(hipFree(transformed_weights1_));
+  ReportHIPErrors(hipFree(biases1_));
   if (has_se_) {
-    ReportCUDAErrors(hipFree(w1_));
-    ReportCUDAErrors(hipFree(w2_));
-    ReportCUDAErrors(hipFree(b1_));
-    ReportCUDAErrors(hipFree(b2_));
+    ReportHIPErrors(hipFree(w1_));
+    ReportHIPErrors(hipFree(w2_));
+    ReportHIPErrors(hipFree(b1_));
+    ReportHIPErrors(hipFree(b2_));
   }
 }
 
 
 // Template instantiation.
+#ifdef USE_CUDNN
+template class ConvLayer<half>;
+template class ConvLayer<float>;
+#endif
+
 template class FCLayer<half>;
 template class FCLayer<float>;
 
@@ -1033,28 +1246,39 @@ template class ResidualBlock<half>;
 template class ResidualBlock<float>;
 
 // Misc error handling stuff.
+#ifdef USE_CUDNN
+void CudnnError(hipdnnStatus_t status, const char* file, const int& line) {
+  if (status != HIPDNN_STATUS_SUCCESS) {
+    char message[128];
+    sprintf(message, "CUDNN error: %s (%s:%d) ", hipdnnGetErrorString(status),
+            file, line);
+    throw Exception(message);
+  }
+}
+#endif
+
 const char* CublasGetErrorString(hipblasStatus_t status) {
   switch (status) {
     case HIPBLAS_STATUS_SUCCESS:
-      return "CUBLAS_STATUS_SUCCESS";
+      return "HIPBLAS_STATUS_SUCCESS";
     case HIPBLAS_STATUS_NOT_INITIALIZED:
-      return "CUBLAS_STATUS_NOT_INITIALIZED";
+      return "HIPBLAS_STATUS_NOT_INITIALIZED";
     case HIPBLAS_STATUS_ALLOC_FAILED:
-      return "CUBLAS_STATUS_ALLOC_FAILED";
+      return "HIPBLAS_STATUS_ALLOC_FAILED";
     case HIPBLAS_STATUS_INVALID_VALUE:
-      return "CUBLAS_STATUS_INVALID_VALUE";
+      return "HIPBLAS_STATUS_INVALID_VALUE";
     case HIPBLAS_STATUS_ARCH_MISMATCH:
-      return "CUBLAS_STATUS_ARCH_MISMATCH";
+      return "HIPBLAS_STATUS_ARCH_MISMATCH";
     case HIPBLAS_STATUS_MAPPING_ERROR:
-      return "CUBLAS_STATUS_MAPPING_ERROR";
+      return "HIPBLAS_STATUS_MAPPING_ERROR";
     case HIPBLAS_STATUS_EXECUTION_FAILED:
-      return "CUBLAS_STATUS_EXECUTION_FAILED";
+      return "HIPBLAS_STATUS_EXECUTION_FAILED";
     case HIPBLAS_STATUS_INTERNAL_ERROR:
-      return "CUBLAS_STATUS_INTERNAL_ERROR";
+      return "HIPBLAS_STATUS_INTERNAL_ERROR";
     case HIPBLAS_STATUS_NOT_SUPPORTED:
-      return "CUBLAS_STATUS_NOT_SUPPORTED";
+      return "HIPBLAS_STATUS_NOT_SUPPORTED";
     case HIPBLAS_STATUS_UNKNOWN:
-      return "CUBLAS_STATUS_LICENSE_ERROR";
+      return "HIPBLAS_STATUS_UNKNOWN";
   }
   return "unknown cublas error";
 }
@@ -1068,10 +1292,10 @@ void CublasError(hipblasStatus_t status, const char* file, const int& line) {
   }
 }
 
-void CudaError(hipError_t status, const char* file, const int& line) {
+void HipError(hipError_t status, const char* file, const int& line) {
   if (status != hipSuccess) {
     char message[128];
-    sprintf(message, "CUDA error: %s (%s:%d) ", hipGetErrorString(status),
+    sprintf(message, "HIP error: %s (%s:%d) ", hipGetErrorString(status),
             file, line);
     throw Exception(message);
   }

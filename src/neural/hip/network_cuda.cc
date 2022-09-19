@@ -14,15 +14,6 @@
 
   You should have received a copy of the GNU General Public License
   along with Leela Chess.  If not, see <http://www.gnu.org/licenses/>.
-
-  Additional permission under GNU GPL version 3 section 7
-
-  If you modify this Program, or any covered work, by linking or
-  combining it with NVIDIA Corporation's libraries from the NVIDIA CUDA
-  Toolkit and the NVIDIA CUDA Deep Neural Network library (or a
-  modified version of those libraries), containing parts covered by the
-  terms of the respective license agreement, the licensors of this
-  Program grant you additional permission to convey the resulting work.
 */
 
 #define __HIP_PLATFORM_AMD__
@@ -34,7 +25,7 @@
 #include <memory>
 #include <mutex>
 
-#include "cuda_common.h"
+#include "hip_common.h"
 #include "inputs_outputs.h"
 #include "kernels.h"
 #include "layers.h"
@@ -135,7 +126,7 @@ class HipNetwork : public Network {
     showInfo();
 
     int total_gpus;
-    ReportCUDAErrors(hipGetDeviceCount(&total_gpus));
+    ReportHIPErrors(hipGetDeviceCount(&total_gpus));
 
     if (gpu_id_ >= total_gpus)
       throw Exception("Invalid GPU Id: " + std::to_string(gpu_id_));
@@ -145,7 +136,7 @@ class HipNetwork : public Network {
     showDeviceInfo(deviceProp);
 
     // Select GPU to run on (for *the current* thread).
-    ReportCUDAErrors(hipSetDevice(gpu_id_));
+    ReportHIPErrors(hipSetDevice(gpu_id_));
 
     multi_stream_ = options.GetOrDefault<bool>("multi_stream", false);
 
@@ -240,7 +231,7 @@ class HipNetwork : public Network {
         max_batch_size_ * kNumFilters * 64 * (36.0 / 16.0) * sizeof(DataType));
     scratch_size_ = std::max(scratch_size_, 2 * transformed_tensor_size);
 
-    ReportCUDAErrors(hipMalloc(&scratch_mem_, scratch_size_));
+    ReportHIPErrors(hipMalloc(&scratch_mem_, scratch_size_));
 
     // 2. Build the network, and copy the weights to GPU memory.
 
@@ -413,8 +404,8 @@ class HipNetwork : public Network {
 
     if (!multi_stream_) {
       for (auto& mem : tensor_mem_) {
-        ReportCUDAErrors(hipMalloc(&mem, maxSize));
-        ReportCUDAErrors(hipMemset(mem, 0, maxSize));
+        ReportHIPErrors(hipMalloc(&mem, maxSize));
+        ReportHIPErrors(hipMemset(mem, 0, maxSize));
       }
     }
 
@@ -536,7 +527,7 @@ class HipNetwork : public Network {
     }
 
     // Copy policy output from device memory to host memory.
-    ReportCUDAErrors(hipMemcpyAsync(
+    ReportHIPErrors(hipMemcpyAsync(
         io->op_policy_mem_, io->op_policy_mem_gpu_,
                         sizeof(float) * kNumOutputPolicy * batchSize,
                         hipMemcpyDeviceToHost, stream));
@@ -602,9 +593,9 @@ class HipNetwork : public Network {
     }
 
     if (multi_stream_) {
-      ReportCUDAErrors(hipStreamSynchronize(stream));
+      ReportHIPErrors(hipStreamSynchronize(stream));
     } else {
-      ReportCUDAErrors(hipDeviceSynchronize());
+      ReportHIPErrors(hipDeviceSynchronize());
       // The next thread can start using the GPU now.
       lock_.unlock();
     }
@@ -631,10 +622,10 @@ class HipNetwork : public Network {
   }
 
   ~HipNetwork() {
-    if (scratch_mem_) ReportCUDAErrors(hipFree(scratch_mem_));
+    if (scratch_mem_) ReportHIPErrors(hipFree(scratch_mem_));
     if (!multi_stream_) {
       for (auto mem : tensor_mem_) {
-        if (mem) ReportCUDAErrors(hipFree(mem));
+        if (mem) ReportHIPErrors(hipFree(mem));
       }
       hipblasDestroy(cublas_);
     }
@@ -647,7 +638,7 @@ class HipNetwork : public Network {
   std::unique_ptr<NetworkComputation> NewComputation() override {
     // Set correct gpu id for this computation (as it might have been called
     // from a different thread).
-    ReportCUDAErrors(hipSetDevice(gpu_id_));
+    ReportHIPErrors(hipSetDevice(gpu_id_));
     return std::make_unique<HipNetworkComputation<DataType>>(this, wdl_,
                                                                moves_left_);
   }
@@ -723,41 +714,20 @@ class HipNetwork : public Network {
       case hipErrorNoDevice:
         throw Exception("No HIP-capable devices detected");
     }
-    int major = version / 1000;
-    int minor = (version - major * 1000) / 10;
-    int pl = version - major * 1000 - minor * 10;
-    CERR << "CUDA Runtime version: " << major << "." << minor << "." << pl;
-    // if (version != CUDART_VERSION) {
-    //   major = CUDART_VERSION / 1000;
-    //   minor = (CUDART_VERSION - major * 1000) / 10;
-    //   pl = CUDART_VERSION - major * 1000 - minor * 10;
-    //   CERR << "WARNING: CUDA Runtime version mismatch, was compiled with "
-    //           "version "
-    //        << major << "." << minor << "." << pl;
-    // }
-    hipDriverGetVersion(&version);
-    major = version / 1000;
-    minor = (version - major * 1000) / 10;
-    pl = version - major * 1000 - minor * 10;
-    CERR << "Latest version of CUDA supported by the driver: " << major << "."
-         << minor << "." << pl;
-    // if (version < CUDART_VERSION) {
-    //   CERR << "WARNING: code was compiled with unsupported CUDA version.";
-    // }
+    CERR << "HIP version: " << version;
   }
 
   void showDeviceInfo(const hipDeviceProp_t& deviceProp) const {
     CERR << "GPU: " << deviceProp.name;
     CERR << "GPU memory: " << deviceProp.totalGlobalMem / std::pow(2.0f, 30)
-         << " Gb";
+         << " GB";
     CERR << "GPU clock frequency: " << deviceProp.clockRate / 1e3f << " MHz";
-    CERR << "GPU compute capability: " << deviceProp.major << "."
-         << deviceProp.minor;
+    CERR << "GPU architecture: " << deviceProp.gcnArchName;
 
-    if (std::is_same<float, DataType>::value && deviceProp.major >= 7) {
-      CERR << "WARNING: you will probably get better performance from the "
-              "cuda-fp16 backend.";
-    }
+    // if (std::is_same<float, DataType>::value && deviceProp.major >= 7) {
+    //   CERR << "WARNING: you will probably get better performance from the "
+    //           "hip-fp16 backend.";
+    // }
   }
 };
 
@@ -784,7 +754,7 @@ std::unique_ptr<Network> MakeHipNetwork(const std::optional<WeightsFile>& w,
                                           const OptionsDict& options) {
   if (!w) {
     throw Exception(
-        "The cuda" +
+        "The HIP" +
         std::string(std::is_same<half, DataType>::value ? "-fp16" : "") +
         " backend requires a network file.");
   }
@@ -796,7 +766,7 @@ std::unique_ptr<Network> MakeHipNetwork(const std::optional<WeightsFile>& w,
     throw Exception(
         "Network format " +
         std::to_string(weights.format().network_format().network()) +
-        " is not supported by the CUDA backend.");
+        " is not supported by the HIP backend.");
   }
   if (weights.format().network_format().policy() !=
           pblczero::NetworkFormat::POLICY_CLASSICAL &&
@@ -804,7 +774,7 @@ std::unique_ptr<Network> MakeHipNetwork(const std::optional<WeightsFile>& w,
           pblczero::NetworkFormat::POLICY_CONVOLUTION) {
     throw Exception("Policy format " +
                     std::to_string(weights.format().network_format().policy()) +
-                    " is not supported by the CUDA backend.");
+                    " is not supported by the HIP backend.");
   }
   if (weights.format().network_format().value() !=
           pblczero::NetworkFormat::VALUE_CLASSICAL &&
@@ -812,7 +782,7 @@ std::unique_ptr<Network> MakeHipNetwork(const std::optional<WeightsFile>& w,
           pblczero::NetworkFormat::VALUE_WDL) {
     throw Exception("Value format " +
                     std::to_string(weights.format().network_format().value()) +
-                    " is not supported by the CUDA backend.");
+                    " is not supported by the HIP backend.");
   }
   if (weights.format().network_format().moves_left() !=
           pblczero::NetworkFormat::MOVES_LEFT_NONE &&
@@ -821,30 +791,11 @@ std::unique_ptr<Network> MakeHipNetwork(const std::optional<WeightsFile>& w,
     throw Exception(
         "Movest left head format " +
         std::to_string(weights.format().network_format().moves_left()) +
-        " is not supported by the CUDA backend.");
+        " is not supported by the HIP backend.");
   }
   return std::make_unique<HipNetwork<DataType>>(weights, options);
 }
 
-std::unique_ptr<Network> MakeHipNetworkAuto(
-    const std::optional<WeightsFile>& weights, const OptionsDict& options) {
-  int gpu_id = options.GetOrDefault<int>("gpu", 0);
-  hipDeviceProp_t deviceProp = {};
-  // No error checking here, this will be repeated later.
-  hipGetDeviceProperties(&deviceProp, gpu_id);
-
-  // Check if the GPU supports FP16.
-  if (deviceProp.major >= 7 ||
-      (deviceProp.major == 6 && deviceProp.minor != 1) ||
-      (deviceProp.major == 5 && deviceProp.minor == 3)) {
-    CERR << "Switching to [cuda-fp16]...";
-    return MakeHipNetwork<half>(weights, options);
-  }
-  CERR << "Switching to [cuda]...";
-  return MakeHipNetwork<float>(weights, options);
-}
-
-REGISTER_NETWORK("hip-auto", MakeHipNetworkAuto, 104)
 REGISTER_NETWORK("hip", MakeHipNetwork<float>, 103)
 REGISTER_NETWORK("hip-fp16", MakeHipNetwork<half>, 102)
 

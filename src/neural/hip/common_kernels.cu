@@ -14,22 +14,13 @@
 
   You should have received a copy of the GNU General Public License
   along with Leela Chess.  If not, see <http://www.gnu.org/licenses/>.
-
-  Additional permission under GNU GPL version 3 section 7
-
-  If you modify this Program, or any covered work, by linking or
-  combining it with NVIDIA Corporation's libraries from the NVIDIA CUDA
-  Toolkit and the NVIDIA CUDA Deep Neural Network library (or a
-  modified version of those libraries), containing parts covered by the
-  terms of the respective license agreement, the licensors of this
-  Program grant you additional permission to convey the resulting work.
 */
 
 
 #include <hip/hip_runtime.h>
 #include <cassert>
 
-#include "cuda_common.h"
+#include "hip_common.h"
 #include "winograd_helper.inc"
 
 namespace lczero {
@@ -39,7 +30,7 @@ constexpr int kInputPlanes = 112;
 }  // namespace
 
 /////////////////////////////////////////////////////////////////////////////
-//          Simple CUDA kernels used by certain layers                     //
+//          Simple HIP kernels used by certain layers                      //
 /////////////////////////////////////////////////////////////////////////////
 
 template <typename T>
@@ -79,7 +70,7 @@ void addVectors(T* c, T* a, T* b, int size, int asize, int bsize, bool relu,
 
   hipLaunchKernelGGL(HIP_KERNEL_NAME(addVectors_kernel), dim3(blocks), dim3(kBlockSize), 0, stream, c, a, b, size, asize, bsize, relu,
                                                        use_tanh, use_sigmoid);
-  ReportCUDAErrors(hipGetLastError());
+  ReportHIPErrors(hipGetLastError());
 }
 
 template <typename T>
@@ -110,7 +101,7 @@ void addBias_NCHW(T* c, T* a, T* b, int N, int C, int H, int W, bool relu, hipSt
   int blocks = DivUp(size, kBlockSize);
 
   hipLaunchKernelGGL(HIP_KERNEL_NAME(addBias_NCHW_kernel), dim3(blocks), dim3(kBlockSize), 0, stream, c, a, b, N, C, H, W, relu);
-  ReportCUDAErrors(hipGetLastError());
+  ReportHIPErrors(hipGetLastError());
 }
 
 __device__ half readNCHW(float* input_tensor, int n, int c, int h, int w,
@@ -212,7 +203,7 @@ void batchNorm(T* output, const T* input, const T* skipInput, int N, int C,
   hipLaunchKernelGGL(HIP_KERNEL_NAME(batchNorm_kernel), dim3(blocks), dim3(kBlockSize), 0, 0, output, input, skipInput, N, C, H, W,
                                            means, var_multipliers, relu);
 
-  ReportCUDAErrors(hipGetLastError());
+  ReportHIPErrors(hipGetLastError());
 }
 
 __global__ void expandPlanes_kernel_Fp32_NCHW(float* output,
@@ -256,7 +247,7 @@ void expandPlanes_Fp32_NCHW(float* output, const uint64_t* masks,
   int blocks = DivUp(threads, blockSize);
   hipLaunchKernelGGL(expandPlanes_kernel_Fp32_NCHW, dim3(blocks), dim3(blockSize), 0, stream, output, masks,
                                                                   values, n);
-  ReportCUDAErrors(hipGetLastError());
+  ReportHIPErrors(hipGetLastError());
 }
 
 // TODO: Can optimize using shared memory if this becomes a bottleneck.
@@ -287,7 +278,7 @@ void expandPlanes_Fp16_NHWC(half* output, const uint64_t* masks,
   const int kBlockSize = 256;
   int blocks = DivUp(threads, kBlockSize);
   hipLaunchKernelGGL(expandPlanes_kernel_Fp16_NHWC, dim3(blocks), dim3(kBlockSize), 0, stream, output, masks, values, n);
-  ReportCUDAErrors(hipGetLastError());
+  ReportHIPErrors(hipGetLastError());
 }
 
 __global__ void expandPlanes_kernel_Fp16_NCHW(half* output,
@@ -331,7 +322,7 @@ void expandPlanes_Fp16_NCHW(half* output, const uint64_t* masks,
   int blocks = DivUp(threads, blockSize);
   hipLaunchKernelGGL(expandPlanes_kernel_Fp16_NCHW, dim3(blocks), dim3(blockSize), 0, stream, output, masks,
                                                                   values, n);
-  ReportCUDAErrors(hipGetLastError());
+  ReportHIPErrors(hipGetLastError());
 }
 
 template <typename T>
@@ -491,7 +482,7 @@ void globalAvgPool(int N, int C, T* output, const T* input,
     hipLaunchKernelGGL(HIP_KERNEL_NAME(globalAvgPool_kernel), dim3(blocks), dim3(kBlockSize), 0, 0, output, input, prevLayerBias,
                                                  N * C * kPlaneSize, N * C, C);
   }
-  ReportCUDAErrors(hipGetLastError());
+  ReportHIPErrors(hipGetLastError());
 }
 
 template <typename T>
@@ -510,7 +501,7 @@ void globalScale(int N, int C, T* output, const T* input, const T* scaleBias,
   } else {
     hipLaunchKernelGGL(HIP_KERNEL_NAME(globalScale_kernel), dim3(kBlocks), dim3(kBlockSize), 0, 0, output, input, scaleBias, prevLayerBias, N * C * 8 * 8, C);
   }
-  ReportCUDAErrors(hipGetLastError());
+  ReportHIPErrors(hipGetLastError());
 }
 
 template <typename T>
@@ -542,7 +533,7 @@ void PolicyMap(int N, T* output, const T* input, const short* indices,
   hipLaunchKernelGGL(HIP_KERNEL_NAME(policyMap_kernel<T>), dim3(kBlocks), dim3(kBlockSize), 0, stream, (T*)output, (T*)input,
                                                (short*)indices, N, inputSize,
                                                usedSize, outputSize);
-  ReportCUDAErrors(hipGetLastError());
+  ReportHIPErrors(hipGetLastError());
 }
 
 template <typename T = float, bool use_se, bool relu, bool use_bias,
@@ -561,7 +552,7 @@ void OutputInputTransform(int N, int C, int se_K, T* output, const T* input,
                                                   use_skip>), dim3(N), dim3(C), 0, stream, N, C, se_K, output, input, (float*)skip, bias, w1,
                               b1, w2, b2);
   }
-  ReportCUDAErrors(hipGetLastError());
+  ReportHIPErrors(hipGetLastError());
 }
 
 // Template instantiation.
