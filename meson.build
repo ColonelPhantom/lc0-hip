@@ -501,7 +501,7 @@ if get_option('build_backends')
         output: outputname,
         arguments: cuda_arguments,
       )
-	 files += cuda_files
+	  files += cuda_files
     files += cuda_gen.process(cuda_files_nvcc_common, extra_args: nvcc_extra_args)
     nvcc_arch = '-arch=compute_70'
     nvcc_sm_list = ['sm_80', 'sm_75', 'sm_86', 'sm_70']
@@ -527,6 +527,35 @@ if get_option('build_backends')
     endif
     files += cuda_gen.process(cuda_files_nvcc_fp16, extra_args: nvcc_extra_args)
     has_backends = true
+  endif
+
+  hipcc = find_program('hipcc', required: false)
+  amdhip64 = cc.find_library('amdhip64', dirs: '/opt/rocm/lib', required: false)
+  hipblas  = cc.find_library('hipblas' , dirs: '/opt/rocm/lib', required: false)
+  if get_option('hip') and hipcc.found() and amdhip64.found() and hipblas.found()
+    deps += [amdhip64, hipblas]
+    hip_files = [
+      'src/neural/hip/layers.cc',
+      'src/neural/hip/network_cuda.cc',
+    ]
+    hipcc_files = [
+      'src/neural/hip/common_kernels.cu',
+      'src/neural/hip/fp16_kernels.cu',
+    ]
+    # TODO: add hipBLAS
+    includes += include_directories('src/neural/hip')
+    hip_arguments = ['@EXTRA_ARGS@', '-c', '@INPUT@', '-o', '@OUTPUT@',
+                     '-I', meson.current_source_dir() + '/src']
+    # TODO: add Windows support (also AMD's job)
+    hip_arguments += ['--std=c++14', '-fPIC']
+    hip_gen = generator(hipcc,
+        output: '@BASENAME@.hip.o',
+        arguments: hip_arguments,
+      )
+    files += hip_files
+    files += hip_gen.process(hipcc_files)
+
+    includes += include_directories('/opt/rocm/include/')
   endif
 
   ## ~~~~~~~~
