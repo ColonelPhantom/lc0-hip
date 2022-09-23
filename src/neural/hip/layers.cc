@@ -43,7 +43,7 @@ template <typename DataType>
 BaseLayer<DataType>::BaseLayer(int c, int h, int w, BaseLayer* ip)
     : input_(ip), C(c), H(h), W(w), nhwc_(ip->nhwc_) {}
 
-#ifdef USE_CUDNN
+#ifdef USE_HIPDNN
 template <typename DataType>
 void ConvLayer<DataType>::init() {
   // Allocate memory for weights (filter tensor) and biases.
@@ -69,38 +69,39 @@ void ConvLayer<DataType>::init() {
   hipdnnCreateTensorDescriptor(&bias_desc_);
   hipdnnCreateActivationDescriptor(&activation_);
 
-  hipdnnSetFilter4dDescriptor(filter_desc_, dataType, layout, GetC(), c_input_,
+  hipdnnSetFilter4dDescriptor(filter_desc_, layout, dataType, GetC(), c_input_,
                              filter_size_, filter_size_);
 
-  ReportCUDNNErrors(
+  ReportHIPDNNErrors(
       hipdnnSetTensor4dDescriptor(bias_desc_, layout, dataType, 1, C, 1, 1));
 
   const int padding = filter_size_ / 2;
   const bool crossCorr = 1;
 
-  ReportCUDNNErrors(hipdnnSetConvolution2dDescriptor(
+  ReportHIPDNNErrors(hipdnnSetConvolution2dDescriptor(
       conv_desc_, padding, padding, 1, 1, 1, 1,
       crossCorr ? HIPDNN_CROSS_CORRELATION : HIPDNN_CONVOLUTION, dataType));
 
   if (fp16 && nhwc_)
-    ReportCUDNNErrors(
+    ReportHIPDNNErrors(
         hipdnnSetConvolutionMathType(conv_desc_, HIPDNN_TENSOR_OP_MATH));
 
   // TODO: dynamic selection of algorithm!
-  if ((C > 32) && (!nhwc_) && (filter_size_ > 1)) {
-    conv_algo_ = HIPDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED;
-  } else {
-    conv_algo_ = HIPDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
-  }
+  //if ((C > 32) && (!nhwc_) && (filter_size_ > 1)) {
+  //  conv_algo_ = HIPDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED;
+  //} else {
+  //  conv_algo_ = HIPDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
+  //}
+  conv_algo_ = HIPDNN_CONVOLUTION_FWD_ALGO_WINOGRAD;
 
   if (use_relu_) {
     hipdnnSetActivationDescriptor(activation_, HIPDNN_ACTIVATION_RELU,
-                                 HIPDNN_NOT_PROPAGATE_NAN, 0.0);
+                                 HIPDNN_NOT_PROPAGATE_NAN, 0.0, 0.0, 0.0);
   }
 #if CUDNN_MAJOR != 7 || CUDNN_MINOR != 0
   else {
     hipdnnSetActivationDescriptor(activation_, HIPDNN_ACTIVATION_PATHTRU,
-                                 HIPDNN_NOT_PROPAGATE_NAN, 0.0);
+                                 HIPDNN_NOT_PROPAGATE_NAN, 0.0, 0.0, 0.0);
   }
 #endif
 }
@@ -183,62 +184,66 @@ void ConvLayer<DataType>::Eval(int N, DataType* output, const DataType* input,
   const hipdnnTensorFormat_t layout =
       nhwc_ ? HIPDNN_TENSOR_NHWC : HIPDNN_TENSOR_NCHW;
 
-  ReportCUDNNErrors(hipdnnSetTensor4dDescriptor(out_tensor_desc_, layout,
+  ReportHIPDNNErrors(hipdnnSetTensor4dDescriptor(out_tensor_desc_, layout,
                                                dataType, N, C, H, W));
 
-  ReportCUDNNErrors(hipdnnSetTensor4dDescriptor(in_tensor_desc_, layout,
+  ReportHIPDNNErrors(hipdnnSetTensor4dDescriptor(in_tensor_desc_, layout,
                                                dataType, N, c_input_, H, W));
 
   float alpha = 1.0f, beta = 0.0f;
 
   if (!(use_relu_ || use_bias_ || input2)) {
-    ReportCUDNNErrors(hipdnnConvolutionForward(
+    ReportHIPDNNErrors(hipdnnConvolutionForward(
         cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
         conv_desc_, conv_algo_, scratch, scratch_size, &beta, out_tensor_desc_,
         output));
   }
 #if CUDNN_MAJOR != 7 || CUDNN_MINOR != 0
-  else if (input2) {
-    // fused bias + sum + relu!
-    ReportCUDNNErrors(cudnnConvolutionBiasActivationForward(
-        cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
-        conv_desc_, conv_algo_, scratch, scratch_size, &alpha, out_tensor_desc_,
-        input2, bias_desc_, biases, activation_, out_tensor_desc_, output));
-  } else {
+  // HIPDNN does not seem to support this function
+  // else if (input2) {
+  //   // fused bias + sum + relu!
+  //   ReportHIPDNNErrors(cudnnConvolutionBiasActivationForward(
+  //       cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
+  //       conv_desc_, conv_algo_, scratch, scratch_size, &alpha, out_tensor_desc_,
+  //       input2, bias_desc_, biases, activation_, out_tensor_desc_, output));
+  // }
+  else {
     // For some reason cudnn doesn't support just Convolution + Bias with nchw
     // (winograd algorithm) it works fine when RELU is also needed which is
     // somewhat strange.
-    if ((!nhwc_) && (!use_relu_)) {
-      ReportCUDNNErrors(hipdnnConvolutionForward(
+    
+    // comment out because hipDNN does not seem to support this
+    // if ((!nhwc_) && (!use_relu_)) {
+      ReportHIPDNNErrors(hipdnnConvolutionForward(
           cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
           conv_desc_, conv_algo_, scratch, scratch_size, &beta,
           out_tensor_desc_, output));
       // add bias
       addBias_NCHW(output, output, biases, N, C, H, W, false, stream);
-    } else {
-      ReportCUDNNErrors(cudnnConvolutionBiasActivationForward(
-          cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
-          conv_desc_, conv_algo_, scratch, scratch_size, &beta,
-          out_tensor_desc_, output, bias_desc_, biases, activation_,
-          out_tensor_desc_, output));
-    }
+    // } else {
+    //   ReportHIPDNNErrors(cudnnConvolutionBiasActivationForward(
+    //       cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
+    //       conv_desc_, conv_algo_, scratch, scratch_size, &beta,
+    //       out_tensor_desc_, output, bias_desc_, biases, activation_,
+    //       out_tensor_desc_, output));
+    // }
   }
 #else
   else {
-    ReportCUDNNErrors(hipdnnConvolutionForward(
+    ReportHIPDNNErrors(hipdnnConvolutionForward(
         cudnn, &alpha, in_tensor_desc_, input, filter_desc_, weights,
         conv_desc_, conv_algo_, scratch, scratch_size,
         (input2 == output) ? &alpha : &beta, out_tensor_desc_, output));
     if (input2 && input2 != output) {
-      ReportCUDNNErrors(hipdnnAddTensor(cudnn, &alpha, out_tensor_desc_, input2,
+      ReportHIPDNNErrors(hipdnnAddTensor(cudnn, &alpha, out_tensor_desc_, input2,
                                        &alpha, out_tensor_desc_, output));
     }
     if (use_bias_) {
-      ReportCUDNNErrors(hipdnnAddTensor(cudnn, &alpha, bias_desc_, biases,
+      ReportHIPDNNErrors(hipdnnAddTensor(cudnn, &alpha, bias_desc_, biases,
                                        &alpha, out_tensor_desc_, output));
     }
     if (use_relu_) {
-      ReportCUDNNErrors(hipdnnActivationForward(cudnn, activation_, &alpha,
+      ReportHIPDNNErrors(hipdnnActivationForward(cudnn, activation_, &alpha,
                                                out_tensor_desc_, output, &beta,
                                                out_tensor_desc_, output));
     }
@@ -1222,7 +1227,7 @@ ResidualBlock<DataType>::~ResidualBlock() {
 
 
 // Template instantiation.
-#ifdef USE_CUDNN
+#ifdef USE_HIPDNN
 template class ConvLayer<half>;
 template class ConvLayer<float>;
 #endif
@@ -1246,11 +1251,11 @@ template class ResidualBlock<half>;
 template class ResidualBlock<float>;
 
 // Misc error handling stuff.
-#ifdef USE_CUDNN
-void CudnnError(hipdnnStatus_t status, const char* file, const int& line) {
+#ifdef USE_HIPDNN
+void HipdnnError(hipdnnStatus_t status, const char* file, const int& line) {
   if (status != HIPDNN_STATUS_SUCCESS) {
     char message[128];
-    sprintf(message, "CUDNN error: %s (%s:%d) ", hipdnnGetErrorString(status),
+    sprintf(message, "HIPDNN error: %s (%s:%d) ", hipdnnGetErrorString(status),
             file, line);
     throw Exception(message);
   }

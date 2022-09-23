@@ -177,3 +177,8 @@ option('hip',
        type: 'boolean',
        value: true,
        description: 'Enable HIP backend')
+
+option('hipdnn',
+       type: 'boolean',
+       value: true,
+       description: 'Enable hipDNN backend')

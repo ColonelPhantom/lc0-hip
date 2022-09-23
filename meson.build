@@ -532,6 +532,7 @@ if get_option('build_backends')
   hipcc = find_program('hipcc', required: false)
   amdhip64 = cc.find_library('amdhip64', dirs: '/opt/rocm/lib', required: false)
   hipblas  = cc.find_library('hipblas' , dirs: '/opt/rocm/lib', required: false)
+  hipdnn   = cc.find_library('hipdnn'  , dirs: '/opt/rocm/lib', required: false)
   if get_option('hip') and hipcc.found() and amdhip64.found() and hipblas.found()
     deps += [amdhip64, hipblas]
     hip_files = [
@@ -543,6 +544,13 @@ if get_option('build_backends')
       'src/neural/hip/fp16_kernels.cu',
     ]
     # TODO: add hipBLAS
+    if get_option('hipdnn') and hipdnn.found()
+      deps += hipdnn
+      hip_files += 'src/neural/hip/network_cudnn.cc'
+      add_project_arguments('-DUSE_HIPDNN', language : 'cpp')
+      includes += include_directories('/opt/rocm/hipdnn/include')
+    endif
+
     includes += include_directories('src/neural/hip')
     hip_arguments = ['@EXTRA_ARGS@', '-c', '@INPUT@', '-o', '@OUTPUT@',
                      '-I', meson.current_source_dir() + '/src']

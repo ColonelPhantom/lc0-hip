@@ -22,7 +22,11 @@
 
 #include "utils/exception.h"
 
+#ifdef USE_HIPDNN
+#include <hipdnn.h>
+#else
 typedef void* hipdnnHandle_t;
+#endif
 
 namespace lczero {
 namespace hip_backend {
@@ -38,9 +42,15 @@ static constexpr int kMaxResBlockFusingSeKFp16Ampere =
 static constexpr int kMaxResBlockFusingSeK =
     128;  // limit on (num_filters / se_ratio)
 
+#ifdef USE_HIPDNN
+void HipdnnError(hipdnnStatus_t status, const char* file, const int& line);
+#endif
 void CublasError(hipblasStatus_t status, const char* file, const int& line);
 void HipError(hipError_t status, const char* file, const int& line);
 
+#ifdef USE_HIPDNN
+#define ReportHIPDNNErrors(status) HipdnnError(status, __FILE__, __LINE__)
+#endif
 #define ReportCUBLASErrors(status) CublasError(status, __FILE__, __LINE__)
 #define ReportHIPErrors(status) HipError(status, __FILE__, __LINE__)
 

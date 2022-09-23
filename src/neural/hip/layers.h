@@ -24,7 +24,11 @@
 
 #include <hipblas/hipblas.h>
 
+#ifdef USE_HIPDNN
+#include <hipdnn.h>
+#else
 typedef void* hipdnnHandle_t;
+#endif
 
 namespace lczero {
 namespace hip_backend {
@@ -58,6 +62,54 @@ class BaseLayer {
 
   bool nhwc_;   // tensor layout
 };
+
+#ifdef USE_HIPDNN
+template <typename DataType>
+class ConvLayer : public BaseLayer<DataType> {
+  using BaseLayer<DataType>::C;
+  using BaseLayer<DataType>::H;
+  using BaseLayer<DataType>::W;
+  using BaseLayer<DataType>::GetC;
+  using BaseLayer<DataType>::GetH;
+  using BaseLayer<DataType>::GetW;
+  using BaseLayer<DataType>::nhwc_;
+
+ public:
+  ConvLayer(BaseLayer<DataType>* ip, int C, int H, int W, int size, int Cin,
+            bool relu = false, bool bias = false);
+  
+  ConvLayer(bool nhwc, int C, int H, int W, int size, int Cin,
+            bool relu = false, bool bias = false);
+
+  ~ConvLayer();
+  void LoadWeights(float* pfilter, float* pBias, void* scratch);
+  void Eval(int N, DataType* output, const DataType* input,
+            const DataType* input2, void* scratch, size_t scratch_size,
+            hipdnnHandle_t cudnn, hipblasHandle_t cublas,
+            hipStream_t stream) override;
+
+ private:
+  const int c_input_;
+  const int filter_size_;
+  const bool use_relu_;
+  const bool use_bias_;
+
+  DataType* biases = nullptr;
+  DataType* weights = nullptr;
+
+  hipdnnFilterDescriptor_t filter_desc_;
+  hipdnnConvolutionDescriptor_t conv_desc_;
+  hipdnnConvolutionFwdAlgo_t conv_algo_;
+
+  hipdnnTensorDescriptor_t bias_desc_;
+  hipdnnTensorDescriptor_t in_tensor_desc_;
+  hipdnnTensorDescriptor_t out_tensor_desc_;
+  hipdnnActivationDescriptor_t activation_;
+
+  void init();
+};
+
+#endif
 
 template <typename DataType>
 class FCLayer : public BaseLayer<DataType> {
